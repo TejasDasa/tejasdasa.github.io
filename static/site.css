@@ -260,7 +260,10 @@ pre.code[data-lang]::before {
 .intro { margin: 2.25rem 0 0; font-size: 1.05rem; }
 .intro p { margin: 0; }
 header.site nav { display: flex; gap: 1rem; }
-header.site nav a[aria-current="page"] { color: var(--fg); text-decoration: none; }
+/* Other pages plain; the current one in the accent color, bold and underlined. */
+header.site nav a { color: var(--fg); text-decoration: none; }
+header.site nav a:hover, header.site nav a:focus-visible { text-decoration: underline; }
+header.site nav a[aria-current="page"] { color: var(--accent); font-weight: 600; text-decoration: underline; }
 .about-head { display: flex; gap: 1.25rem; align-items: center; margin: 2.5rem 0 1rem; }
 .about-head h1 { margin: 0; font-size: 2rem; line-height: 1.2; }
 .about-head .summary { margin: .3rem 0 0; color: var(--muted); font-size: 1.1rem; }
