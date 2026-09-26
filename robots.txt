@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://tejasdasa.github.io/sitemap.xml

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Transformer Runtime · Tejas Dasa</title>
+<meta name="description" content="A C++/CUDA transformer inference runtime, built operator by operator against a CPU reference, heading toward a paged KV-cache manager and multi-request scheduling.">
+<link rel="canonical" href="https://tejasdasa.github.io/projects/cuda-runtime">
+<meta property="og:url" content="https://tejasdasa.github.io/projects/cuda-runtime">
+<meta property="og:site_name" content="Tejas Dasa">
+<meta property="og:type" content="article">
+<meta property="og:title" content="CUDA Transformer Runtime">
+<meta property="og:description" content="A C++/CUDA transformer inference runtime, built operator by operator against a CPU reference, heading toward a paged KV-cache manager and multi-request scheduling.">
+<link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+<header class="site">
+  <a class="name" href="/">tejas dasa</a>
+  <nav>
+    <a href="/" aria-current="page">projects</a>
+    <a href="/about">about</a>
+  </nav>
+</header>
+<main>
+
+<article class="project">
+  <header class="project-head">
+    <p class="crumb"><a href="/">projects</a> / 03</p>
+    <h1>CUDA Transformer Runtime</h1>
+    <p class="summary">A C++/CUDA transformer inference runtime, built operator by operator against a CPU reference, heading toward a paged KV-cache manager and multi-request scheduling.</p>
+    <dl class="meta">
+      <dt>status</dt><dd><span class="status">stage 2 of 9: first CUDA operators</span></dd>
+      <dt>repo</dt><dd><a href="https://github.com/TejasDasa/cuda-transformer-runtime">github.com/TejasDasa/cuda-transformer-runtime</a></dd>
+    </dl>
+  </header>
+
+  <div class="prose">
+<p>A transformer inference runtime in C++17 and CUDA, targeting compute
+capability 12.0, running the Stories15M checkpoint. The goal is to build it,
+understand its execution and memory behavior, then extend it with KV-cache
+management and scheduling. The distinctive part is measuring how memory layout
+and execution choices affect inference.</p>
+<p>Every operation goes through the same loop: understand it, write a CPU
+reference, write the CUDA version, compare the results, then measure.</p>
+<h2>Where it is</h2>
+<p><strong>Checkpoint loading.</strong> <code>inspect_checkpoint</code> memory-maps the model file rather than reading it. A 7-field
+header gives the model shape: dimension, hidden dimension, layers, attention
+heads, KV heads, vocabulary and maximum sequence length. The inspector rejects any
+shape that cannot be a valid model: heads that don’t divide the dimension, more
+KV heads than attention heads, an odd head size for RoPE. It then computes
+every weight tensor’s offset into the mapping: embeddings, per-layer attention
+and FFN weights (<code>wq</code>/<code>wk</code>/<code>wv</code>/<code>wo</code>, <code>w1</code>/<code>w2</code>/<code>w3</code>), RMSNorm weights, RoPE
+frequency tables and the classifier, which may share the embedding table. It
+checks that the expected size matches the file byte for byte before anything
+touches the weights.</p>
+<p><strong>Kernels.</strong> RMSNorm and matrix-vector multiply, each tested against its CPU
+version at 1e-5 relative plus 1e-5 absolute tolerance, on shapes that are not a multiple of the warp size
+(7 × 289).</p>
+<pre class="code" data-lang="cuda"><code><span class="hl-source hl-c++">__global__ <span class="hl-storage hl-type hl-c">void</span> <span class="hl-meta hl-function hl-c++"><span class="hl-meta hl-toc-list hl-full-identifier hl-c++"><span class="hl-entity hl-name hl-function hl-c++">matvec_kernel</span></span></span><span class="hl-meta hl-function hl-parameters hl-c++"><span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span></span></span><span class="hl-meta hl-function hl-parameters hl-c++"><span class="hl-meta hl-group hl-c++"><span class="hl-storage hl-type hl-c">float</span><span class="hl-keyword hl-operator hl-c">*</span> <span class="hl-variable hl-parameter hl-c++">output</span><span class="hl-punctuation hl-separator hl-c++">,</span> <span class="hl-storage hl-modifier hl-c++">const</span> <span class="hl-storage hl-type hl-c">float</span><span class="hl-keyword hl-operator hl-c">*</span> <span class="hl-variable hl-parameter hl-c++">matrix</span><span class="hl-punctuation hl-separator hl-c++">,</span> <span class="hl-storage hl-modifier hl-c++">const</span> <span class="hl-storage hl-type hl-c">float</span><span class="hl-keyword hl-operator hl-c">*</span> <span class="hl-variable hl-parameter hl-c++">input</span><span class="hl-punctuation hl-separator hl-c++">,</span> <span class="hl-storage hl-type hl-c">int</span> <span class="hl-variable hl-parameter hl-c++">rows</span><span class="hl-punctuation hl-separator hl-c++">,</span> <span class="hl-storage hl-type hl-c">int</span> <span class="hl-variable hl-parameter hl-c++">cols</span><span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span></span><span class="hl-meta hl-function hl-c++">
+</span><span class="hl-meta hl-function hl-c++"><span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-begin hl-c++">{</span></span></span><span class="hl-meta hl-function hl-c++"><span class="hl-meta hl-block hl-c++">
+    __shared__ <span class="hl-storage hl-type hl-c">float</span> partial<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span><span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">32</span><span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+
+    <span class="hl-storage hl-type hl-c">int</span> i <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> threadIdx<span class="hl-punctuation hl-accessor hl-dot hl-c++">.</span><span class="hl-variable hl-other hl-readwrite hl-member hl-c++">x</span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-storage hl-type hl-c">int</span> row <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> blockIdx<span class="hl-punctuation hl-accessor hl-dot hl-c++">.</span><span class="hl-variable hl-other hl-readwrite hl-member hl-c++">x</span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-storage hl-type hl-c">int</span> j <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> i<span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-storage hl-type hl-c">float</span> local_sum <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> <span class="hl-constant hl-numeric hl-float hl-decimal hl-c++">0<span class="hl-punctuation hl-separator hl-decimal hl-c++">.</span>0<span class="hl-storage hl-type hl-numeric hl-c++">f</span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+
+    <span class="hl-keyword hl-control hl-c++">while</span> <span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span>j <span class="hl-keyword hl-operator hl-comparison hl-c">&lt;</span> cols<span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span> <span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-begin hl-c++">{</span>
+        local_sum <span class="hl-keyword hl-operator hl-assignment hl-augmented hl-c">+=</span> matrix<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>row <span class="hl-keyword hl-operator hl-c">*</span> cols <span class="hl-keyword hl-operator hl-arithmetic hl-c">+</span> j<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span> <span class="hl-keyword hl-operator hl-c">*</span> input<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>j<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+        j <span class="hl-keyword hl-operator hl-assignment hl-augmented hl-c">+=</span> blockDim<span class="hl-punctuation hl-accessor hl-dot hl-c++">.</span><span class="hl-variable hl-other hl-readwrite hl-member hl-c++">x</span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-punctuation hl-section hl-block hl-end hl-c++">}</span></span>
+    partial<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>i<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span> <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> local_sum<span class="hl-punctuation hl-terminator hl-c++">;</span>
+
+    <span class="hl-meta hl-function-call hl-c++"><span class="hl-variable hl-function hl-c++">__syncthreads</span><span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span></span></span><span class="hl-meta hl-function-call hl-c++"></span><span class="hl-meta hl-function-call hl-c++"><span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+
+    <span class="hl-storage hl-type hl-c">int</span> stride <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> <span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">16</span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+
+    <span class="hl-keyword hl-control hl-c++">while</span> <span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span>stride <span class="hl-keyword hl-operator hl-comparison hl-c">&gt;</span> <span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">0</span><span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span> <span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-begin hl-c++">{</span>
+        <span class="hl-keyword hl-control hl-c++">if</span> <span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span>i <span class="hl-keyword hl-operator hl-comparison hl-c">&lt;</span> stride<span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span> <span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-begin hl-c++">{</span>
+            partial<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>i<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span> <span class="hl-keyword hl-operator hl-assignment hl-augmented hl-c">+=</span> partial<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>i <span class="hl-keyword hl-operator hl-arithmetic hl-c">+</span> stride<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+        <span class="hl-punctuation hl-section hl-block hl-end hl-c++">}</span></span>
+
+        <span class="hl-meta hl-function-call hl-c++"><span class="hl-variable hl-function hl-c++">__syncthreads</span><span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span></span></span><span class="hl-meta hl-function-call hl-c++"></span><span class="hl-meta hl-function-call hl-c++"><span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+        stride <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> stride <span class="hl-keyword hl-operator hl-arithmetic hl-c">/</span> <span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">2</span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-punctuation hl-section hl-block hl-end hl-c++">}</span></span>
+
+    <span class="hl-keyword hl-control hl-c++">if</span> <span class="hl-meta hl-group hl-c++"><span class="hl-punctuation hl-section hl-group hl-begin hl-c++">(</span>i <span class="hl-keyword hl-operator hl-comparison hl-c">==</span> <span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">0</span><span class="hl-punctuation hl-section hl-group hl-end hl-c++">)</span></span> <span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-begin hl-c++">{</span>
+        output<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span>row<span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span> <span class="hl-keyword hl-operator hl-assignment hl-c">=</span> partial<span class="hl-meta hl-brackets hl-c++"><span class="hl-punctuation hl-section hl-brackets hl-begin hl-c++">[</span><span class="hl-constant hl-numeric hl-integer hl-decimal hl-c++">0</span><span class="hl-punctuation hl-section hl-brackets hl-end hl-c++">]</span></span><span class="hl-punctuation hl-terminator hl-c++">;</span>
+    <span class="hl-punctuation hl-section hl-block hl-end hl-c++">}</span></span>
+</span></span><span class="hl-meta hl-function hl-c++"><span class="hl-meta hl-block hl-c++"><span class="hl-punctuation hl-section hl-block hl-end hl-c++">}</span></span></span>
+</span></code></pre>
+<p>One warp-sized block per output row, a strided partial dot product per thread,
+then a shared-memory tree reduction.</p>
+<h2>Roadmap</h2>
+<table><thead><tr><th></th><th>stage</th><th>deliverable</th><th></th></tr></thead><tbody>
+<tr><td>1</td><td>Load the model</td><td>memory-mapped, validated checkpoint with tensor views and embedding lookup</td><td>done</td></tr>
+<tr><td>2</td><td>First CUDA operators</td><td>layer-0 RMSNorm → Q/K/V projections, CPU vs GPU, intermediates kept on the GPU</td><td><strong>current</strong></td></tr>
+<tr><td>3</td><td>One transformer layer</td><td>RoPE, contiguous KV cache, attention with stable softmax, output projection, SwiGLU FFN; checked at several token positions</td><td></td></tr>
+<tr><td>4</td><td>Generate text</td><td>all six layers, tokenizer, greedy then temperature sampling, compared against an established implementation</td><td></td></tr>
+<tr><td>5</td><td>Performance baseline</td><td>time to first token, per-token latency, memory by category, per-kernel and transfer time</td><td></td></tr>
+<tr><td>6</td><td>Optimize the kernels</td><td>matvec mapping and coalescing, warp vs shared-memory reductions, fusion, lower precision; before/after with error checks</td><td></td></tr>
+<tr><td>7</td><td>KV-cache manager</td><td>block-based cache from a fixed pool with per-sequence block tables, attention over paged layout</td><td></td></tr>
+<tr><td>8</td><td>Multiple requests</td><td>admission control, batched decode, chunked prefill; throughput, latency and fairness under load</td><td></td></tr>
+<tr><td>9</td><td>Package it</td><td>architecture and memory-layout docs, reproducible benchmarks, plots, limitations</td><td></td></tr>
+</tbody></table>
+<p>Milestones are correct text generation (stage 4), measured optimization
+(stage 6), then memory management and scheduling (stages 7–8).</p>
+<p>The KV-cache manager is a cache-design problem in software: allocation
+granularity, logical-to-physical translation through the block
+table, locality and capacity, and how that layout interacts with the attention
+kernels that read it.</p>
+<h2>Benchmarks</h2>
+<blockquote>
+<p><strong>Placeholder:</strong> none yet. Charts arrive with the stage 5 baseline, once
+text generation works end to end.</p>
+</blockquote>
+
+  </div>
+
+  
+  <section class="assets">
+    <h2>Artifacts</h2>
+    
+    
+    <figure class="asset asset-slot" id="asset-bench" data-kind="bench">
+      <div class="asset-body">
+        <span class="asset-kind">bench</span>
+        <span class="slot-label">asset slot · bench · pending</span>
+      </div>
+      <figcaption>Latency, throughput and baseline comparisons (bench.toml).</figcaption>
+    </figure>
+    
+    
+  </section>
+  
+</article>
+
+
+
+</main>
+<footer class="site">computer architecture · RTL · GPU systems</footer>
+</body>
+</html>
