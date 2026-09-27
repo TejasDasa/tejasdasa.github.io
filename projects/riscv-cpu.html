@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RISC-V CPU · Tejas Dasa</title>
-<meta name="description" content="An RV32I core and bare-metal SoC in SystemVerilog: single-cycle and running a preemptive scheduler on a Zynq-7000 FPGA, with a five-stage pipeline in verification.">
+<meta name="description" content="A five-stage pipelined RV32I + Zicsr core with precise traps and interrupts, and a bare-metal SoC in SystemVerilog; an earlier single-cycle version runs a preemptive scheduler on a Zynq-7000 FPGA.">
 <link rel="canonical" href="https://tejasdasa.github.io/projects/riscv-cpu">
 <meta property="og:url" content="https://tejasdasa.github.io/projects/riscv-cpu">
 <meta property="og:site_name" content="Tejas Dasa">
 <meta property="og:type" content="article">
 <meta property="og:title" content="RISC-V CPU">
-<meta property="og:description" content="An RV32I core and bare-metal SoC in SystemVerilog: single-cycle and running a preemptive scheduler on a Zynq-7000 FPGA, with a five-stage pipeline in verification.">
+<meta property="og:description" content="A five-stage pipelined RV32I + Zicsr core with precise traps and interrupts, and a bare-metal SoC in SystemVerilog; an earlier single-cycle version runs a preemptive scheduler on a Zynq-7000 FPGA.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.png" type="image/png" sizes="64x64">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -30,9 +30,9 @@
   <header class="project-head">
     <p class="crumb"><a href="/projects/">projects</a> / 02</p>
     <h1>RISC-V CPU</h1>
-    <p class="summary">An RV32I core and bare-metal SoC in SystemVerilog: single-cycle and running a preemptive scheduler on a Zynq-7000 FPGA, with a five-stage pipeline in verification.</p>
+    <p class="summary">A five-stage pipelined RV32I + Zicsr core with precise traps and interrupts, and a bare-metal SoC in SystemVerilog; an earlier single-cycle version runs a preemptive scheduler on a Zynq-7000 FPGA.</p>
     <dl class="meta">
-      <dt>status</dt><dd><span class="status">single-cycle on FPGA · pipeline in progress</span></dd>
+      <dt>status</dt><dd><span class="status">pipeline verified in simulation · FPGA revalidation next</span></dd>
       <dt>repo</dt><dd><a href="https://github.com/TejasDasa/RISC-V-Processor">github.com/TejasDasa/RISC-V-Processor</a></dd>
     </dl>
   </header>
@@ -48,7 +48,7 @@ preemptive round-robin scheduler, deployed on a Digilent Cora Z7-07S
 <tr><td>Memory</td><td>Harvard: separate instruction and data memories</td></tr>
 <tr><td>SoC</td><td>memory-mapped bus, UART TX, machine timer, GPIO, interrupt controller</td></tr>
 <tr><td>Target</td><td>Digilent Cora Z7-07S, Zynq-7000 programmable logic</td></tr>
-<tr><td>Verification</td><td>unit and SoC testbenches, 31 regression programs, SVA, seeded random differential tests</td></tr>
+<tr><td>Verification</td><td>unit and SoC testbenches, 31 regression programs, SVA, retirement-level random differential testing</td></tr>
 </tbody></table>
 <h2>Pipeline</h2>
 <pre class="code"><code>    IF          ID          EX          MEM         WB
@@ -62,20 +62,32 @@ store-data paths</li>
 <li>One-cycle load-use stall: PC and IF/ID freeze, a bubble goes into ID/EX</li>
 <li>Branches and jumps resolve in EX; a taken redirect flushes the younger
 instructions</li>
-<li>Traps are precise. <code>ECALL</code>, illegal instructions and the machine timer
-interrupt all resolve in EX: the instruction there is flushed and recorded
-as <code>mepc</code>, fetch redirects to <code>mtvec</code>, and <code>MRET</code> re-executes it. The timer
-interrupt waveform below shows the whole sequence.</li>
+<li>Traps are precise. EX is the single commit point for privileged side
+effects: nothing in MEM or WB can fault, so an instruction that leaves EX
+will retire. On a trap, the older instructions in MEM and WB complete, the
+trapping instruction is killed with no register, CSR or memory side
+effects, the younger ones are flushed, <code>mepc</code> and <code>mcause</code> are written,
+<code>MIE</code> is stacked into <code>MPIE</code>, and fetch redirects to <code>mtvec</code>.</li>
+<li><code>ECALL</code> (cause 11), illegal instructions (cause 2) and the machine timer
+interrupt (<code>0x8000_0007</code>) all resolve this way. An interrupt is taken only
+on a valid instruction, so a pending one waits out bubbles, and the
+interrupted instruction re-executes after <code>MRET</code>. The timer interrupt
+waveform below shows the whole sequence.</li>
+<li>Priority: reset, then trap or interrupt, then <code>MRET</code>, then <code>JALR</code>, <code>JAL</code> or
+a taken branch, then the load-use stall. An interrupt overrides even an
+exception on the same instruction, which simply runs again after the
+handler returns.</li>
 <li>Zicsr is complete: <code>CSRRW</code>, <code>CSRRS</code>, <code>CSRRC</code> and their immediate forms,
 with <code>CSRRS</code>/<code>CSRRC</code> writing nothing when the source is <code>x0</code>. The CSR file
 holds <code>mstatus</code>, <code>mie</code>, <code>mip</code>, <code>mtvec</code>, <code>mscratch</code>, <code>mepc</code>, <code>mcause</code> and
 <code>mtval</code>; <code>mstatus</code> is WARL, with only <code>MIE</code> and <code>MPIE</code> writable and <code>MPP</code>
 reading as M-mode. Touching any other CSR raises an illegal-instruction
 trap in EX with no write-back.</li>
+<li>Not yet implemented: <code>EBREAK</code>, <code>WFI</code> and misaligned-address exceptions.</li>
 </ul>
-<p>Redirect priority in EX, from <code>core.sv</code> on the
-<a href="https://github.com/TejasDasa/RISC-V-Processor/tree/waveform-demos"><code>waveform-demos</code></a>
-branch, where <code>ex_trap</code> covers both exceptions and interrupts:</p>
+<p>Redirect priority in EX, from
+<a href="https://github.com/TejasDasa/RISC-V-Processor/blob/main/rtl/core/core.sv"><code>core.sv</code></a>,
+where <code>ex_trap</code> covers both exceptions and interrupts:</p>
 <pre class="code" data-lang="systemverilog"><code><span class="hl-source hl-systemverilog"><span class="hl-keyword hl-control hl-systemverilog">always_comb</span> <span class="hl-keyword hl-control hl-systemverilog">begin</span>
 <span class="hl-meta hl-userdefined hl-systemverilog">    </span>ex_redirect    <span class="hl-keyword hl-operator hl-assignment hl-systemverilog">=</span> <span class="hl-constant hl-numeric hl-systemverilog">1&#39;b0</span>;
 <span class="hl-meta hl-userdefined hl-systemverilog">    </span>ex_redirect_pc <span class="hl-keyword hl-operator hl-assignment hl-systemverilog">=</span> <span class="hl-constant hl-numeric hl-systemverilog">32&#39;b0</span>;
@@ -124,23 +136,56 @@ crosses into it: an MMIO UART feeds a PL mailbox, a synchronized VALID/ACK
 handshake carries each byte across the clock domain to AXI GPIO, and Cortex-A9
 firmware forwards it out through PS UART0 to the host.</p>
 <p>These runs used the <strong>single-cycle</strong> version of the core. The pipelined core
-now takes traps and timer interrupts in simulation, and has not yet been
-revalidated on the board.</p>
+runs the same preemptive scheduler in simulation, as a regression test, and has
+not yet been revalidated on the board.</p>
 <h2>Verification</h2>
 <ul>
-<li><strong>Unit and integration.</strong> Self-checking testbenches for every block from the
+<li>
+<p><strong>Unit and integration.</strong> Self-checking testbenches for every block from the
 ALU to the full SoC, and 31 assembly and C regression programs checked
-against expected output.</li>
-<li><strong>Retirement monitor.</strong> The core exposes <code>retire_valid</code>, <code>retire_pc</code>,
+against expected output.</p>
+</li>
+<li>
+<p><strong>Directed privileged-mode tests.</strong> Back-to-back CSR reads and writes with
+forwarding at distances 1–3; every Zicsr form, WARL <code>mstatus</code> and illegal
+CSRs; synchronous traps with older instructions completing and younger ones
+flushed; <code>MIE</code>/<code>MPIE</code> stacking; the same block interrupted at every
+instruction position, through load-use stalls, taken branches, <code>JAL</code>/<code>JALR</code>,
+CSR ops and stores, with every run matching the uninterrupted checksum;
+enable gating and re-taken interrupts; and a preemptive two-task scheduler.</p>
+</li>
+<li>
+<p><strong>Retirement monitor.</strong> The core exposes <code>retire_valid</code>, <code>retire_pc</code>,
 <code>retire_instr</code> and the written register, so checking follows committed
-instructions independent of pipeline timing.</li>
-<li><strong>Assertions.</strong> <code>x0</code> stays zero; invalid pipeline entries never change state
-or touch memory; load-use hazards stall the PC and inject a bubble; redirects
-flush younger instructions.</li>
-<li><strong>Random differential.</strong> A seeded generator emits RV32I programs biased toward
-back-to-back dependencies; they run on the RTL under Verilator and on an
-independent Python reference model, and all 32 registers are compared.
-ALU instructions today; loads, stores and branches are next.</li>
+instructions independent of pipeline timing. A trapped instruction never
+retires; it appears as a trap event, with its cause, at its program-order
+position.</p>
+</li>
+<li>
+<p><strong>Assertions</strong>, in every simulation flow. <code>x0</code> stays zero; invalid pipeline
+entries never change state or touch memory; load-use hazards stall the PC
+unless a redirect overrides them; traps redirect to <code>mtvec</code> and <code>MRET</code> to
+<code>mepc</code>; traps are taken only on valid instructions; no younger instruction
+reaches MEM after a trap; and an enabled, pending interrupt is never skipped.</p>
+</li>
+<li>
+<p><strong>Random differential.</strong> A seeded generator mixes ALU ops, load-use pairs,
+word loads and stores, taken and not-taken branches, <code>JAL</code>/<code>JALR</code> calls with
+wrong-path victim instructions, all six Zicsr forms, <code>ECALL</code> and illegal
+instructions through a generated trap handler, and timer interrupts on a
+per-seed schedule. The RTL runs under Verilator and an independent Python
+model replays it; the two are compared retirement by retirement (PC,
+register, value), on every trap event (kind, PC, cause and position), and on
+all registers and modified memory at the end.</p>
+<p>Interrupt timing depends on RTL cycles, which the model does not simulate,
+so it replays each interrupt where the RTL took it and rejects any that
+lands on the wrong PC or arrives while interrupts are disabled; an RTL
+assertion covers the opposite case, an enabled interrupt the RTL skipped.
+50 seeds of 300 instructions retire about 21,000 instructions with about 370
+exceptions and 175 interrupts. The checker is mutation-tested: an <code>ECALL</code>
+<code>mepc</code> of PC+4, an interrupt that skips its instruction, and immediate CSR
+forms reading the wrong source are each caught.</p>
+</li>
 </ul>
 
   </div>
